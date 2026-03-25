@@ -2,22 +2,42 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import os
+import anthropic
+import json
 
-# Page setup
+# ─── Constants ────────────────────────────────────────────────────────────────
+PENALTY_NORMAL = -2
+PENALTY_SENSITIVE = -3
+DECISION_THRESHOLDS = {"ok": 5, "revise": 2}
+
+CRITERIA = [
+    {"key": "sensitivity",      "label": "⚠️ This post might feel tone-deaf or too celebratory", "type": "risk"},
+    {"key": "risk_trigger",     "label": "⚠️ Might cause panic or confusion",                    "type": "risk"},
+    {"key": "aggressive_promo", "label": "⚠️ Feels too promotional or pushy",                    "type": "risk"},
+    {"key": "customer_value",   "label": "✅ This post helps customers (inform / guide / ease shopping)", "type": "positive"},
+    {"key": "clarity",          "label": "✅ Message is clear within 5 seconds",                 "type": "positive"},
+    {"key": "reassurance",      "label": "✅ Adds reassurance (stores open, availability, etc.)", "type": "positive"},
+    {"key": "relevance",        "label": "✅ Relevant to current situation",                      "type": "positive"},
+    {"key": "tone_balance",     "label": "✅ Tone is gentle (not overly festive)",                "type": "positive"},
+    {"key": "actionability",    "label": "✅ Tells customers what to do",                         "type": "positive"},
+]
+
+LOG_FILE = "posting_log.csv"
+
+# ─── Page setup ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="CMHL Posting Guide", layout="centered")
 
 st.title("🛒 CMHL Content Decision Tool")
 st.caption("Keep every post calm, clear, and customer-first")
-
 st.warning("⚠️ Use this tool before posting any content during sensitive periods")
 
-# Context selection
+# ─── Context ──────────────────────────────────────────────────────────────────
 mode = st.radio("Select Context", ["Normal", "Sensitive Period (Thingyan / Crisis)"])
 
 st.divider()
 
-# Post input
-post_name = st.text_area(
+# ─── Post input ───────────────────────────────────────────────────────────────
+post_caption = st.text_area(
     "📝 Enter Post Caption / Name (Max 500 characters)",
     max_chars=500,
     placeholder="Type your post caption here..."
@@ -25,66 +45,42 @@ post_name = st.text_area(
 
 st.subheader("📝 Quick Evaluation")
 
-# Checklist inputs
-data = {
-    "sensitivity": st.checkbox("⚠️ This post might feel tone-deaf or too celebratory"),
-    "customer_value": st.checkbox("✅ This post helps customers (inform / guide / ease shopping)"),
-    "clarity": st.checkbox("✅ Message is clear within 5 seconds"),
-    "reassurance": st.checkbox("✅ Adds reassurance (stores open, availability, etc.)"),
-    "relevance": st.checkbox("✅ Relevant to current situation"),
-    "tone_balance": st.checkbox("✅ Tone is gentle (not overly festive)"),
-    "actionability": st.checkbox("✅ Tells customers what to do"),
-    "risk_trigger": st.checkbox("⚠️ Might cause panic or confusion"),
-    "aggressive_promo": st.checkbox("⚠️ Feels too promotional or pushy")
-}
+# ─── Checklist UI (driven by CRITERIA config) ─────────────────────────────────
+checklist = {}
+for item in CRITERIA:
+    checklist[item["key"]] = st.checkbox(item["label"])
 
-# Evaluation logic
-def evaluate_post(data, mode):
+# ─── Logic ────────────────────────────────────────────────────────────────────
+def evaluate_post(checklist: dict, mode: str) -> tuple[int, str, list[str]]:
     score = 0
+    penalty = PENALTY_SENSITIVE if mode == "Sensitive Period (Thingyan / Crisis)" else PENALTY_NORMAL
 
-    risk_penalty = -3 if mode == "Sensitive Period (Thingyan / Crisis)" else -2
+    for item in CRITERIA:
+        key = item["key"]
+        if item["type"] == "risk":
+            score += penalty if checklist[key] else 1
+        else:
+            score += 1 if checklist[key] else 0
 
-    # Negative factors
-    score += risk_penalty if data["sensitivity"] else 1
-    score += risk_penalty if data["risk_trigger"] else 1
-    score += risk_penalty if data["aggressive_promo"] else 1
-
-    # Positive factors
-    positives = [
-        "customer_value",
-        "clarity",
-        "reassurance",
-        "relevance",
-        "tone_balance",
-        "actionability"
-    ]
-
-    for key in positives:
-        if data[key]:
-            score += 1
-
-    # Decision
-    if score >= 5:
+    if score >= DECISION_THRESHOLDS["ok"]:
         decision = "✅ OK to Post"
-    elif score >= 2:
+    elif score >= DECISION_THRESHOLDS["revise"]:
         decision = "⚠️ Revise Before Posting"
     else:
         decision = "❌ Do NOT Post"
 
-    # Suggestions
     suggestions = []
-
-    if data["sensitivity"]:
+    if checklist["sensitivity"]:
         suggestions.append("Tone down message — avoid celebratory language")
-    if data["risk_trigger"]:
+    if checklist["risk_trigger"]:
         suggestions.append("Remove urgency / panic wording")
-    if data["aggressive_promo"]:
+    if checklist["aggressive_promo"]:
         suggestions.append("Reduce hard selling tone")
-    if not data["reassurance"]:
+    if not checklist["reassurance"]:
         suggestions.append("Add reassurance (stores open, availability, etc.)")
-    if not data["clarity"]:
+    if not checklist["clarity"]:
         suggestions.append("Simplify message (5-second rule)")
-    if not data["actionability"]:
+    if not checklist["actionability"]:
         suggestions.append("Tell customers what to do (shop early, delivery, etc.)")
 
     if not suggestions:
@@ -93,61 +89,135 @@ def evaluate_post(data, mode):
     return score, decision, suggestions
 
 
-# Save function
-def save_to_csv(data, score, decision, post_name):
-    file_name = "posting_log.csv"
+def analyze_with_ai(caption: str, mode: str) -> dict:
+    """Send the caption to Claude for tone and risk analysis."""
+    client = anthropic.Anthropic()
 
-    new_row = {
+    system_prompt = """You are a social media content reviewer for a Myanmar retail grocery chain called CMHL.
+Your job is to evaluate post captions for tone, risk, and customer value — especially during sensitive cultural 
+or crisis periods like Thingyan (Water Festival) or emergencies.
+
+Respond ONLY with a valid JSON object — no preamble, no markdown, no code fences.
+
+The JSON must have exactly these keys:
+{
+  "tone": "calm | neutral | celebratory | alarming | pushy",
+  "risk_level": "low | medium | high",
+  "customer_value": "high | medium | low",
+  "summary": "One sentence summary of the post's intent.",
+  "ai_suggestions": ["suggestion 1", "suggestion 2"],
+  "revised_caption": "A revised version of the caption if improvements are needed, otherwise return the original."
+}"""
+
+    user_message = f"""Context: {mode}
+
+Post caption to review:
+\"{caption}\"
+
+Evaluate this caption and return the JSON."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}]
+    )
+
+    raw = message.content[0].text.strip()
+    return json.loads(raw)
+
+
+def save_to_csv(checklist: dict, score: int, decision: str, post_name: str, ai_result: dict | None):
+    row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "post_name": post_name,
-        "sensitivity": data["sensitivity"],
-        "customer_value": data["customer_value"],
-        "clarity": data["clarity"],
-        "reassurance": data["reassurance"],
-        "relevance": data["relevance"],
-        "tone_balance": data["tone_balance"],
-        "actionability": data["actionability"],
-        "risk_trigger": data["risk_trigger"],
-        "aggressive_promo": data["aggressive_promo"],
+        **{item["key"]: checklist[item["key"]] for item in CRITERIA},
         "score": score,
-        "decision": decision
+        "decision": decision,
+        "ai_tone": ai_result.get("tone", "") if ai_result else "",
+        "ai_risk": ai_result.get("risk_level", "") if ai_result else "",
+        "ai_customer_value": ai_result.get("customer_value", "") if ai_result else "",
+        "ai_summary": ai_result.get("summary", "") if ai_result else "",
     }
 
-    df_new = pd.DataFrame([new_row])
+    try:
+        df_new = pd.DataFrame([row])
+        if os.path.exists(LOG_FILE):
+            df_existing = pd.read_csv(LOG_FILE)
+            df = pd.concat([df_existing, df_new], ignore_index=True)
+        else:
+            df = df_new
+        df.to_csv(LOG_FILE, index=False)
+    except Exception as e:
+        st.error(f"⚠️ Could not save log: {e}")
 
-    if os.path.exists(file_name):
-        df_existing = pd.read_csv(file_name)
-        df = pd.concat([df_existing, df_new], ignore_index=True)
-    else:
-        df = df_new
 
-    df.to_csv(file_name, index=False)
+@st.cache_data
+def load_history():
+    if os.path.exists(LOG_FILE):
+        return pd.read_csv(LOG_FILE)
+    return pd.DataFrame()
 
 
-# Button action
+# ─── Evaluate button ──────────────────────────────────────────────────────────
 if st.button("🚀 Evaluate Post"):
-    if not post_name.strip():
+    if not post_caption.strip():
         st.warning("⚠️ Please enter a post caption before evaluating.")
     else:
-        score, decision, suggestions = evaluate_post(data, mode)
+        score, decision, suggestions = evaluate_post(checklist, mode)
 
-        save_to_csv(data, score, decision, post_name)
+        # ── AI Analysis ──
+        ai_result = None
+        with st.spinner("🤖 Running AI analysis on your caption..."):
+            try:
+                ai_result = analyze_with_ai(post_caption, mode)
+            except Exception as e:
+                st.warning(f"AI analysis unavailable: {e}")
+
+        save_to_csv(checklist, score, decision, post_caption, ai_result)
 
         st.divider()
 
-        st.metric("Score", score)
-        st.markdown(f"### {decision}")
+        # ── Checklist result ──
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Checklist Score", score)
+        with col2:
+            st.markdown(f"### {decision}")
 
-        st.write("### 💡 Suggestions")
+        st.write("### 💡 Checklist Suggestions")
         for s in suggestions:
             st.write(f"- {s}")
 
+        # ── AI result ──
+        if ai_result:
+            st.divider()
+            st.subheader("🤖 AI Analysis")
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Tone", ai_result.get("tone", "—").capitalize())
+            col2.metric("Risk Level", ai_result.get("risk_level", "—").capitalize())
+            col3.metric("Customer Value", ai_result.get("customer_value", "—").capitalize())
+
+            st.write("**Summary:**", ai_result.get("summary", ""))
+
+            if ai_result.get("ai_suggestions"):
+                st.write("**AI Suggestions:**")
+                for s in ai_result["ai_suggestions"]:
+                    st.write(f"- {s}")
+
+            revised = ai_result.get("revised_caption", "")
+            if revised and revised != post_caption:
+                st.write("**✍️ Suggested Revised Caption:**")
+                st.info(revised)
+
         st.info("👉 Final check: Does this make customers feel more confident or more confused?")
 
-
-# Show history
-if os.path.exists("posting_log.csv"):
-    st.divider()
-    st.subheader("📊 Posting History")
-    df = pd.read_csv("posting_log.csv")
+# ─── History ──────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("📊 Posting History")
+df = load_history()
+if df.empty:
+    st.caption("No evaluations logged yet.")
+else:
     st.dataframe(df)
